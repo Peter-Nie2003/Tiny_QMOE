@@ -48,39 +48,11 @@ def compress_model(quantized_model, compression_table, sequence_length=4):
         param_index += 1
     return compressed_files
 
-def decompress_model(compressed_files, compression_table, sequence_length=4):
-    decompression_table = {idx: seq for seq, idx in compression_table.items()}
-    decompressed_weights = []
-    for filename in compressed_files:
-        compressed_data = np.load(filename)
-        i = 0
-        while i < len(compressed_data):
-            codeword = compressed_data[i]
-            i += 1
-            if codeword == 0xFFFF:
-                # Read raw values
-                raw_values = compressed_data[i:i + sequence_length].astype(np.uint8)
-                decompressed_weights.extend(raw_values)
-                i += sequence_length
-            else:
-                sequence = decompression_table[codeword]
-                decompressed_weights.extend(sequence)
-    return np.array(decompressed_weights, dtype=np.uint8)
-
-def reconstruct_model(decompressed_weights, model_template):
-    offset = 0
-    for param in model_template.parameters():
-        num_elements = param.numel()
-        param_data = decompressed_weights[offset:offset + num_elements].reshape(param.shape)
-        param.data = torch.tensor(param_data, dtype=param.dtype).to(param.device)
-        offset += num_elements
-    return model_template
-
 def main():
     import os
 
     # Path to your quantized model
-    model_path = "your-quantized-model-path"
+    model_path = "llama3.2-1B-quantized"
 
     # Load the tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -97,22 +69,14 @@ def main():
         # Step 3: Compress the model
         compressed_files = compress_model(quantized_model, compression_table)
         
-        # Save the compression table
         with open('compression_table.pkl', 'wb') as f:
             pickle.dump(compression_table, f)
         
         print("Model compressed and saved.")
     else:
-        # Load the compression table
         with open('compression_table.pkl', 'rb') as f:
             compression_table = pickle.load(f)
         print("Loaded existing compressed files and compression table.")
-
-    # Decompress and reconstruct the model
-    decompressed_weights = decompress_model(compressed_files, compression_table)
-    quantized_model = reconstruct_model(decompressed_weights, quantized_model)
-
-    print("Decompression successful.")
 
 if __name__ == '__main__':
     main()
