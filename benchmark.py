@@ -109,12 +109,12 @@ def decompress_model(compressed_weights, compression_table, model_template, sequ
 
     return model_template
 
-def evaluate_quality(generated_text, reference_text):
-    # Placeholder for quality evaluation
-    # You can implement specific evaluation metrics here
-    # For now, we'll just return 0
-    quality_score = 0.0
-    return quality_score
+# def evaluate_quality(generated_text, reference_text):
+#     # Placeholder for quality evaluation
+#     # You can implement specific evaluation metrics here
+#     # For now, we'll just return 0
+#     quality_score = 0.0
+#     return quality_score
 
 def evaluate_mmlu(model, tokenizer, k_shot=5):
     from datasets import load_dataset
@@ -393,34 +393,355 @@ def evaluate_math(model, tokenizer):
     accuracy = correct / total if total > 0 else 0.0
     return accuracy
 
+def evaluate_arc_challenge(model, tokenizer):
+    import torch
+    from datasets import load_dataset
+    import re
+
+    # Load the ARC Challenge dataset
+    dataset = load_dataset('ai2_arc', 'ARC-Challenge')
+
+    total = 0
+    correct = 0
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+
+    # Limit to first 100 samples for testing; adjust as needed
+    max_samples = 100
+
+    for sample in dataset['test']:
+        question = sample['question'].strip()
+        choices = sample['choices']['text']
+        labels = sample['choices']['label']
+        correct_answer = sample['answerKey'].strip()
+
+        # Prepare the prompt
+        prompt = f"Question: {question}\nChoices:\n"
+        for label, choice in zip(labels, choices):
+            prompt += f"{label}: {choice}\n"
+        prompt += "Answer:"
+
+        inputs = tokenizer(prompt, return_tensors='pt').to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=10,
+                temperature=0.0,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Extract the first character after 'Answer:' as the predicted label
+        gen_answer_match = re.search(r'Answer:\s*([A-Za-z])', generated_text)
+        if gen_answer_match:
+            predicted_answer = gen_answer_match.group(1).strip().upper()
+        else:
+            predicted_answer = None
+
+        if predicted_answer == correct_answer:
+            correct += 1
+
+        total += 1
+        if total >= max_samples:
+            break
+
+    accuracy = correct / total if total > 0 else 0.0
+    return accuracy
+
+def evaluate_gpqa(model, tokenizer):
+    import torch
+    from datasets import load_dataset
+    import re
+
+    # Load a general QA dataset; using 'nq_open' as an example
+    dataset = load_dataset('nq_open')
+
+    total = 0
+    correct = 0
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+
+    # Limit to first 100 samples for testing; adjust as needed
+    max_samples = 100
+
+    for sample in dataset['test']:
+        question = sample['question'].strip()
+        answers = sample['answers']
+
+        # Prepare the prompt
+        prompt = f"Question: {question}\nAnswer:"
+
+        inputs = tokenizer(prompt, return_tensors='pt').to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=50,
+                temperature=0.0,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Extract the generated answer
+        generated_answer = generated_text.split('Answer:')[-1].strip()
+
+        # Check if the generated answer matches any of the reference answers
+        if any(generated_answer.lower() == ans.lower() for ans in answers):
+            correct += 1
+
+        total += 1
+        if total >= max_samples:
+            break
+
+    accuracy = correct / total if total > 0 else 0.0
+    return accuracy
+
+def evaluate_hellaswag(model, tokenizer):
+    import torch
+    from datasets import load_dataset
+    import re
+
+    # Load the HellaSwag dataset
+    dataset = load_dataset('hellaswag')
+
+    total = 0
+    correct = 0
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+
+    # Limit to first 100 samples for testing; adjust as needed
+    max_samples = 100
+
+    for sample in dataset['validation']:
+        context = sample['ctx_a'].strip()
+        endings = [sample[f'ending_{i}'].strip() for i in range(4)]
+        correct_label = sample['label']
+
+        # Prepare the prompt
+        prompt = f"{context}"
+
+        inputs = tokenizer(prompt, return_tensors='pt').to(device)
+
+        with torch.no_grad():
+            logits = []
+            for ending in endings:
+                input_ids_option = tokenizer.encode(ending, return_tensors='pt').to(device)
+                total_input = torch.cat([inputs['input_ids'], input_ids_option], dim=-1)
+                attention_mask = torch.ones_like(total_input).to(device)
+                output = model(input_ids=total_input, attention_mask=attention_mask)
+                # Get the log probability of the continuation
+                logit = output.logits[:, -input_ids_option.size(-1):, :]
+                log_probs = torch.nn.functional.log_softmax(logit, dim=-1)
+                selected_log_probs = log_probs.gather(2, input_ids_option.unsqueeze(-1)).squeeze(-1)
+                total_log_prob = selected_log_probs.sum().item()
+                logits.append(total_log_prob)
+
+            predicted_label = logits.index(max(logits))
+
+            if predicted_label == correct_label:
+                correct += 1
+
+        total += 1
+        if total >= max_samples:
+            break
+
+    accuracy = correct / total if total > 0 else 0.0
+    return accuracy
+
+def evaluate_infinitebench_mc(model, tokenizer):
+    import torch
+    import os
+    import json
+
+    # Path to InfiniteBench En.MC dataset
+    dataset_path = 'path_to_infinitebench/En.MC'  # Update accordingly
+
+    total = 0
+    correct = 0
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+
+    # Limit to a few samples for testing due to resource constraints
+    max_samples = 10
+
+    # Load the dataset
+    with open(os.path.join(dataset_path, 'test.json'), 'r') as f:
+        data = json.load(f)
+
+    for sample in data['data'][:max_samples]:
+        context = sample['context']
+        question = sample['question']
+        choices = sample['choices']
+        correct_answer = sample['answer']
+
+        # Prepare the prompt
+        prompt = f"{context}\n\nQuestion: {question}\nChoices:\n"
+        for idx, choice in enumerate(choices):
+            prompt += f"{idx}: {choice}\n"
+        prompt += "Answer:"
+
+        inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=128000).to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=10,
+                temperature=0.0,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # Extract the predicted choice index
+        predicted_answer = int(generated_text.strip().split('Answer:')[-1].strip())
+
+        if predicted_answer == correct_answer:
+            correct += 1
+
+        total += 1
+
+    accuracy = correct / total if total > 0 else 0.0
+    return accuracy
+
+def evaluate_mgsm(model, tokenizer):
+    import torch
+    from datasets import load_dataset
+    import re
+
+    # Load the MGSM dataset; assuming it's available via Hugging Face Datasets
+    dataset = load_dataset('mgsm')
+
+    total = 0
+    correct = 0
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+
+    # Limit to first 100 samples for testing; adjust as needed
+    max_samples = 100
+
+    for sample in dataset['test']:
+        question = sample['question'].strip()
+        answer = sample['answer'].strip()
+
+        # Prepare the prompt with zero-shot CoT
+        prompt = question + "\nAnswer: Let's think step by step."
+
+        inputs = tokenizer(prompt, return_tensors='pt').to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=256,
+                temperature=0.0,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        # Extract the final answer from the generated text
+        # The final answer is usually after '####' or the last number
+        gen_answer_match = re.search(r'####\s*(.*)', generated_text)
+        if gen_answer_match:
+            gen_final_answer = gen_answer_match.group(1).strip()
+        else:
+            # Fallback: extract the last number in the generated text
+            gen_numbers = re.findall(r'\d+\.?\d*', generated_text)
+            gen_final_answer = gen_numbers[-1] if gen_numbers else None
+
+        # Extract the final answer from the reference answer
+        ref_answer_match = re.search(r'####\s*(.*)', answer)
+        if ref_answer_match:
+            ref_final_answer = ref_answer_match.group(1).strip()
+        else:
+            ref_numbers = re.findall(r'\d+\.?\d*', answer)
+            ref_final_answer = ref_numbers[-1] if ref_numbers else None
+
+        if gen_final_answer and ref_final_answer:
+            # Compare the numerical answers
+            if gen_final_answer == ref_final_answer:
+                correct += 1
+
+        total += 1
+        if total >= max_samples:
+            break
+
+    accuracy = correct / total if total > 0 else 0.0
+    return accuracy
+
 def main():
+    import argparse
+    import sys
+
+    # Parse command-line arguments
     parser = argparse.ArgumentParser(description='Benchmark different versions of Llama-3.2-1B.')
-    parser.add_argument('--model_type', type=str, required=True, choices=['original', 'quantized', 'compressed'],
+    parser.add_argument('--model_type', type=str, required=True,
+                        choices=['original', 'quantized', 'compressed'],
                         help='Type of model to benchmark.')
-    parser.add_argument('--model_path', type=str, required=True, help='Path to the model directory.')
-    parser.add_argument('--input_text', type=str, required=True, help='Input text to the model.')
-    parser.add_argument('--reference_text', type=str, default='', help='Reference text for quality evaluation.')
+    parser.add_argument('--model_path', type=str, required=True,
+                        help='Path to the model directory.')
+    parser.add_argument('--benchmark', type=str, required=True,
+                        choices=['mmlu', 'open_rewrite', 'tldr9', 'ifeval', 'gsm8k', 'math',
+                                 'arc_challenge', 'gpqa', 'hellaswag', 'infinitebench_mc', 'mgsm'],
+                        help='Name of the benchmark to run.')
     args = parser.parse_args()
 
+    # Load the tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+
+    # Load the model based on the type
     if args.model_type == 'original':
-        generated_text, num_tokens_output, inference_time = run_original_model(args.model_path, args.input_text)
+        model = run_original_model(args.model_path)
     elif args.model_type == 'quantized':
-        generated_text, num_tokens_output, inference_time = run_quantized_model(args.model_path, args.input_text)
+        model = run_quantized_model(args.model_path)
     elif args.model_type == 'compressed':
-        generated_text, num_tokens_output, inference_time = run_compressed_model(args.model_path, args.input_text)
+        model = run_compressed_model(args.model_path)
     else:
         print("Invalid model type selected.")
         sys.exit(1)
 
-    # Evaluate quality (placeholder)
-    quality_score = evaluate_quality(generated_text, args.reference_text)
-
-    # Print results
-    print(f"Model Type: {args.model_type}")
-    print(f"Inference Time: {inference_time:.2f} seconds")
-    print(f"Number of Tokens Outputted: {num_tokens_output}")
-    print(f"Quality Score: {quality_score}")
-    print(f"Generated Text:\n{generated_text}")
+    # Run the selected benchmark
+    if args.benchmark == 'mmlu':
+        accuracy = evaluate_mmlu(model, tokenizer)
+        print(f"MMLU Accuracy: {accuracy:.2%}")
+    elif args.benchmark == 'open_rewrite':
+        average_rougeL = evaluate_open_rewrite(model, tokenizer)
+        print(f"Open-Rewrite Average Rouge-L Score: {average_rougeL:.4f}")
+    elif args.benchmark == 'tldr9':
+        average_rougeL = evaluate_tldr9(model, tokenizer)
+        print(f"TLDR9+ Average Rouge-L Score: {average_rougeL:.4f}")
+    elif args.benchmark == 'ifeval':
+        average_rougeL = evaluate_ifeval(model, tokenizer)
+        print(f"IFEval Average Rouge-L Score: {average_rougeL:.4f}")
+    elif args.benchmark == 'gsm8k':
+        accuracy = evaluate_gsm8k(model, tokenizer)
+        print(f"GSM8K Accuracy: {accuracy:.2%}")
+    elif args.benchmark == 'math':
+        accuracy = evaluate_math(model, tokenizer)
+        print(f"MATH Accuracy: {accuracy:.2%}")
+    elif args.benchmark == 'arc_challenge':
+        accuracy = evaluate_arc_challenge(model, tokenizer)
+        print(f"ARC Challenge Accuracy: {accuracy:.2%}")
+    elif args.benchmark == 'gpqa':
+        accuracy = evaluate_gpqa(model, tokenizer)
+        print(f"GPQA Accuracy: {accuracy:.2%}")
+    elif args.benchmark == 'hellaswag':
+        accuracy = evaluate_hellaswag(model, tokenizer)
+        print(f"HellaSwag Accuracy: {accuracy:.2%}")
+    elif args.benchmark == 'infinitebench_mc':
+        accuracy = evaluate_infinitebench_mc(model, tokenizer)
+        print(f"InfiniteBench En.MC Accuracy: {accuracy:.2%}")
+    elif args.benchmark == 'mgsm':
+        accuracy = evaluate_mgsm(model, tokenizer)
+        print(f"MGSM Accuracy: {accuracy:.2%}")
+    else:
+        print(f"Benchmark {args.benchmark} not recognized.")
+        sys.exit(1)
 
 if __name__ == '__main__':
     main()
+    # python benchmark.py --model_type original --model_path path_to_model --benchmark gsm8k
