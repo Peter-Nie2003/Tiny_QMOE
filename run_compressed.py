@@ -102,8 +102,8 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description='Run compressed model with text input.')
-    parser.add_argument('--compressed_weights_dir', type=str,default="llama3.2-1B_Compressed", help='Directory containing compressed weights')
-    parser.add_argument('--compression_tables_dir', type=str, default="llama3.2-1B_Compressed", help='Directory containing compression tables')
+    parser.add_argument('--compressed_weights_dir', type=str,default="llama-3.2-1B_Compressed", help='Directory containing compressed weights')
+    parser.add_argument('--compression_tables_dir', type=str, default="llama-3.2-1B_Compressed", help='Directory containing compression tables')
     parser.add_argument('--model_name_or_path', type=str, default="llama3.2-1B-quantized", help='Pretrained model name or path')
     parser.add_argument('--input_text', type=str, default="Once upon a time, in a faraway land,", help='Input text for the model')
     parser.add_argument('--output_text_file', type=str, default='output.txt', help='File to save the output text')
