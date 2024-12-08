@@ -1,747 +1,546 @@
-import argparse
-import time
+import os
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 import numpy as np
-import sys
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset, get_dataset_config_names, concatenate_datasets
+import argparse
+import torch.nn as nn
+import time
+import pandas as pd
 
-#python benchmark.py --model_type original --model_path path_to_original_model --input_text "Your input text here"
+class CompressedLinear(nn.Module):
+    def __init__(self, in_features, out_features, compression_table, compressed_weight, bias=None, sequence_length=4):
+        super(CompressedLinear, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.compression_table = compression_table
+        self.compressed_weight = compressed_weight
+        self.sequence_length = sequence_length
+        if bias is not None:
+            self.bias = nn.Parameter(torch.tensor(bias, dtype=torch.float32))
+        else:
+            self.register_parameter('bias', None)
 
-def run_original_model(model_path, input_text):
-    # Load the tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(model_path)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
-
-    inputs = tokenizer(input_text, return_tensors='pt').to(device)
-    
-    # Measure inference time
-    start_time = time.time()
-    with torch.no_grad():
-        output = model.generate(**inputs, max_length=50)
-    end_time = time.time()
-
-    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    num_tokens_output = len(tokenizer.tokenize(generated_text))
-    inference_time = end_time - start_time
-
-    return generated_text, num_tokens_output, inference_time
-
-def run_quantized_model(model_path, input_text):
-    # Load the tokenizer and model
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(model_path)
-
-    # Ensure the model is quantized (if using a specific quantization method, adjust accordingly)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
-
-    inputs = tokenizer(input_text, return_tensors='pt').to(device)
-    
-    # Measure inference time
-    start_time = time.time()
-    with torch.no_grad():
-        output = model.generate(**inputs, max_length=50)
-    end_time = time.time()
-
-    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    num_tokens_output = len(tokenizer.tokenize(generated_text))
-    inference_time = end_time - start_time
-
-    return generated_text, num_tokens_output, inference_time
-
-def run_compressed_model(model_path, input_text):
-    # Load the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-    # Load compressed weights
-    compressed_weights = np.load('compressed_weights.npy')
-
-    # Load compression table
-    with open('compression_table.pkl', 'rb') as f:
-        compression_table = pickle.load(f)
-
-    # Load the model template
-    model_template = AutoModelForCausalLM.from_pretrained(model_path)
-
-    # Decompress and reconstruct the model
-    model = decompress_model(compressed_weights, compression_table, model_template)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
-
-    inputs = tokenizer(input_text, return_tensors='pt').to(device)
-    
-    # Measure inference time
-    start_time = time.time()
-    with torch.no_grad():
-        output = model.generate(**inputs, max_length=50)
-    end_time = time.time()
-
-    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
-    num_tokens_output = len(tokenizer.tokenize(generated_text))
-    inference_time = end_time - start_time
-
-    return generated_text, num_tokens_output, inference_time
-
-def decompress_model(compressed_weights, compression_table, model_template, sequence_length=8):
-    reverse_table = {idx: seq for seq, idx in compression_table.items()}
-    decompressed_weights = []
-
-    for idx in compressed_weights:
-        sequence = reverse_table[idx]
-        decompressed_weights.extend(sequence)
-
-    decompressed_weights = np.array(decompressed_weights, dtype=np.uint8)
-
-    # Reconstruct the model's parameters
-    offset = 0
-    for param in model_template.parameters():
-        num_elements = param.numel()
-        param_data = decompressed_weights[offset:offset + num_elements].reshape(param.shape)
-        param.data = torch.from_numpy(param_data.astype(param.dtype)).to(param.device)
-        offset += num_elements
-
-    return model_template
-
-# def evaluate_quality(generated_text, reference_text):
-#     # Placeholder for quality evaluation
-#     # You can implement specific evaluation metrics here
-#     # For now, we'll just return 0
-#     quality_score = 0.0
-#     return quality_score
-
-def evaluate_mmlu(model, tokenizer, k_shot=5):
-    from datasets import load_dataset
-    mmlu = load_dataset('hendrycks_test')
-    subjects = mmlu['train'].features.keys()
-    total_correct = 0
-    total_questions = 0
-
-    for subject in subjects:
-        train_examples = mmlu['train'][subject][:k_shot]
-        few_shot_prompt = ''
-        for ex in train_examples:
-            few_shot_prompt += f"Question: {ex['question']}\nAnswer: {ex['answer']}\n\n"
-
-        test_examples = mmlu['test'][subject]
-        for ex in test_examples:
-            prompt = few_shot_prompt + f"Question: {ex['question']}\nAnswer:"
-            inputs = tokenizer(prompt, return_tensors='pt').to(model.device)
-            with torch.no_grad():
-                outputs = model.generate(**inputs, max_length=inputs['input_ids'].shape[1] + 10)
-            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            predicted_answer = generated_text.strip().split('Answer:')[-1].strip()
-            correct_answer = ex['answer'].strip()
-            if predicted_answer == correct_answer:
-                total_correct += 1
-            total_questions += 1
-
-    accuracy = total_correct / total_questions
-    return accuracy
-
-def evaluate_open_rewrite(model, tokenizer):
-    from datasets import load_dataset
-    from rouge_score import rouge_scorer
-
-    dataset = load_dataset('open_rewrite_eval')
-    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-
-    total_score = 0
-    total_examples = 0
-
-    for ex in dataset['test']:
-        input_text = ex['input']
-        reference_text = ex['reference']
-        inputs = tokenizer(input_text, return_tensors='pt').to(model.device)
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_length=inputs['input_ids'].shape[1] + 50)
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        score = scorer.score(reference_text, generated_text)['rougeL'].fmeasure
-        total_score += score
-        total_examples += 1
-
-    average_score = total_score / total_examples
-    return average_score
-
-def evaluate_tldr9(model, tokenizer):
-    from datasets import load_dataset
-    from rouge_score import rouge_scorer
-
-    dataset = load_dataset('tldr_dataset')
-    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-
-    total_score = 0
-    total_examples = 0
-
-    for ex in dataset['test']:
-        input_text = ex['article']
-        reference_summary = ex['summary']
-        prompt = f"{input_text}\n\nTL;DR:"
-        inputs = tokenizer(prompt, return_tensors='pt').to(model.device)
-        with torch.no_grad():
-            outputs = model.generate(**inputs, max_length=inputs['input_ids'].shape[1] + 50)
-        generated_summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        score = scorer.score(reference_summary, generated_summary)['rougeL'].fmeasure
-        total_score += score
-        total_examples += 1
-
-    average_score = total_score / total_examples
-    return average_score
-
-def evaluate_ifeval(model, tokenizer):
-    import torch
-    import csv
-    import os
-    from rouge_score import rouge_scorer
-
-    # Path to the IFEval dataset CSV file (adjust accordingly)
-    dataset_path = 'path_to_ifeval_dataset/ifeval.csv'  # Update with your dataset path
-
-    total = 0
-    total_rougeL = 0.0
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
-
-    scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-
-    # Ensure the dataset exists
-    if not os.path.exists(dataset_path):
-        print("IFEval dataset not found at the specified path.")
-        return None
-
-    with open(dataset_path, 'r', encoding='utf-8') as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            instruction = row['instruction']
-            input_text = row.get('input', '')
-            reference_output = row['output']
-
-            # Prepare the prompt
-            if input_text:
-                prompt = f"Instruction: {instruction}\nInput: {input_text}\nResponse:"
+    def decompress_weights(self):
+        decompression_table = {idx: seq for seq, idx in self.compression_table.items()}
+        decompressed_weight = []
+        compressed_data = self.compressed_weight
+        i = 0
+        while i < len(compressed_data):
+            codeword = compressed_data[i]
+            i += 1
+            if codeword == 0xFFFF:
+                # Read raw values
+                raw_values = compressed_data[i:i + self.sequence_length].astype(np.uint8)
+                decompressed_weight.extend(raw_values)
+                i += self.sequence_length
             else:
-                prompt = f"Instruction: {instruction}\nResponse:"
+                sequence = decompression_table[codeword]
+                decompressed_weight.extend(sequence)
+        decompressed_weight = np.array(decompressed_weight, dtype=np.uint8)
+        # Convert to appropriate dtype and reshape
+        weight_tensor = torch.from_numpy(decompressed_weight.astype(np.float32))
+        weight_tensor = weight_tensor.view(self.out_features, self.in_features)
+        return weight_tensor
 
-            inputs = tokenizer(prompt, return_tensors='pt').to(device)
+    def forward(self, input):
+        weight = self.decompress_weights().to(input.device)
+        if self.bias is not None:
+            bias = self.bias.to(input.device)
+            return nn.functional.linear(input, weight, bias)
+        else:
+            return nn.functional.linear(input, weight)
 
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=256,
-                    temperature=0.0,
-                    eos_token_id=tokenizer.eos_token_id,
+def load_compression_table(filename):
+    import pickle
+    with open(filename, 'rb') as f:
+        return pickle.load(f)
+
+def replace_linear_layers(model, compressed_weights_dir, compression_tables_dir, sequence_length=4):
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            layer_path = name.replace('.', '_')
+            compressed_weight_path = os.path.join(compressed_weights_dir, f'compressed_weights_{layer_path}.npy')
+            compression_table_path = os.path.join(compression_tables_dir, f'compression_table_{layer_path}.pkl')
+            bias_path = os.path.join(compressed_weights_dir, f'bias_{layer_path}.npy')
+
+            if os.path.exists(compressed_weight_path) and os.path.exists(compression_table_path):
+                
+                compressed_weight = np.load(compressed_weight_path)
+                compression_table = load_compression_table(compression_table_path)
+
+                
+                if module.bias is not None and os.path.exists(bias_path):
+                    bias = np.load(bias_path)
+                else:
+                    bias = None
+
+                
+                compressed_linear = CompressedLinear(
+                    in_features=module.in_features,
+                    out_features=module.out_features,
+                    compression_table=compression_table,
+                    compressed_weight=compressed_weight,
+                    bias=bias,
+                    sequence_length=sequence_length
                 )
 
-            generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                parent_module = model
+                sub_names = name.split('.')
+                for sub_name in sub_names[:-1]:
+                    parent_module = getattr(parent_module, sub_name)
+                setattr(parent_module, sub_names[-1], compressed_linear)
+            else:
+                print(f"Compression data not found for layer: {name}")
 
-            # Compute Rouge-L score
-            score = scorer.score(reference_output, generated_text)['rougeL'].fmeasure
-            total_rougeL += score
-            total += 1
+def create_prompt(question, options, answer=None):
+    """
+    Create a prompt for the model given a question and options.
+    If answer is provided, include it in the prompt.
 
-            if total >= 100:  # Limit to first 100 samples
-                break
+    Args:
+        question: The question string.
+        options: A list of options.
+        answer: The correct answer string (optional).
 
-    average_rougeL = total_rougeL / total if total > 0 else 0.0
-    return average_rougeL
+    Returns:
+        prompt: The prompt string.
+    """
+    prompt = f"{question}\n"
+    option_labels = ['A', 'B', 'C', 'D']
+    for label, option in zip(option_labels, options):
+        prompt += f"{label}. {option}\n"
+    prompt += "Answer:"
+    if answer is not None:
+        prompt += f" {answer}\n\n"
+    else:
+        prompt += " "
+    return prompt
 
-def evaluate_gsm8k(model, tokenizer):
-    import torch
-    from datasets import load_dataset
-    import re
 
-    # Load the GSM8K dataset
-    gsm8k = load_dataset('gsm8k', 'main')
-
-    total = 0
-    correct = 0
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
+def evaluate_mmlu(model, tokenizer, device, few_shot=False):
     model.eval()
+    model.to(device)
 
-    # Limit to first 100 samples for testing; remove or adjust for full evaluation
-    max_samples = 100
+    total_questions = 0
+    total_correct = 0
+    total_latency = 0
 
-    for sample in gsm8k['test']:
-        question = sample['question'].strip()
-        answer = sample['answer'].strip()
+    # Get all available configs (subjects)
+    configs = get_dataset_config_names('hendrycks_test')
 
-        # Prepare the prompt with zero-shot CoT
-        prompt = question + "\nAnswer: Let's think step by step."
+    for subject in configs:
+        print(f"\nEvaluating subject: {subject}")
 
-        inputs = tokenizer(prompt, return_tensors='pt').to(device)
+        # Load the dataset for the specific subject
+        dataset = load_dataset('hendrycks_test', subject, cache_dir="MMLU_data", ignore_verifications=True)
+        print(f"Available splits for {subject}: {list(dataset.keys())}")
 
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=256,
-                temperature=0.0,
-                eos_token_id=tokenizer.eos_token_id,
+        # Load validation and test splits
+        validation_dataset = dataset['validation'] if 'validation' in dataset else None
+        test_dataset = dataset['test'] if 'test' in dataset else None
+
+        if test_dataset is None:
+            print(f"No 'test' split found for subject: {subject}")
+            continue
+
+        if few_shot and validation_dataset is None:
+            print(f"No 'validation' split found for subject: {subject}, cannot perform few-shot evaluation.")
+            continue
+
+        if few_shot:
+            validation_examples = [example for example in validation_dataset]
+            if len(validation_examples) < 5:
+                print(f"Warning: Validation dataset for {subject} has less than 5 examples.")
+                validation_examples *= (5 // len(validation_examples)) + 1  # Replicate as needed
+            import random
+            random.seed(42)
+
+        # Now process each example in the test_dataset
+        for idx, example in enumerate(test_dataset):
+
+            try:
+                # For few-shot evaluation, construct the few-shot context
+                if few_shot:
+                    # Sample 5 examples from validation_examples
+                    few_shot_examples = random.sample(validation_examples, 5)
+                    # Construct the few-shot context
+                    few_shot_prompt = ""
+                    for few_shot_example in few_shot_examples:
+                        # Get question, options, correct answer
+                        fs_question = few_shot_example['question']
+                        fs_options = few_shot_example['choices']
+                        fs_correct_answer = few_shot_example['answer']
+
+                        # Map the correct answer to the text of the option
+                        if isinstance(fs_correct_answer, int):
+                            fs_correct_answer_index = fs_correct_answer
+                        else:
+                            answer_mapping = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+                            fs_correct_answer_index = answer_mapping.get(fs_correct_answer.strip(), -1)
+
+                        # Get the correct option text
+                        if 0 <= fs_correct_answer_index < len(fs_options):
+                            fs_correct_option = fs_options[fs_correct_answer_index]
+                        else:
+                            # Skip if invalid
+                            continue
+
+                        # Create the prompt for this example, including the answer
+                        fs_prompt = create_prompt(fs_question, fs_options, fs_correct_option)
+
+                        few_shot_prompt += fs_prompt
+                else:
+                    few_shot_prompt = ""
+
+                # Now construct the prompt for the test question
+                question = example['question']
+                options = example['choices']
+                correct_answer = example['answer']
+
+                # Adjust answer mapping if necessary
+                if isinstance(correct_answer, int):
+                    correct_answer_index = correct_answer
+                else:
+                    answer_mapping = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+                    correct_answer_index = answer_mapping.get(correct_answer.strip(), -1)
+
+                # Create the prompt for the test question (without the answer)
+                test_prompt = create_prompt(question, options)
+
+                # Combine the few-shot context and the test prompt
+                prompt = few_shot_prompt + test_prompt
+
+                # Proceed with the rest of the code: computing log-likelihoods for each option
+                start_time = time.time()
+                # For each option, compute the log-likelihood
+                option_scores = []
+                for opt_idx, option in enumerate(options):
+                    # Prepare input text
+                    input_text = prompt + f" {option}"
+
+                    # Tokenize the entire input
+                    inputs = tokenizer(input_text, return_tensors='pt').to(device)
+
+                    # Identify the position of the option tokens in the input_ids
+                    option_tokens = tokenizer.encode(" " + option, add_special_tokens=False)
+                    option_length = len(option_tokens)
+                    start_position = inputs['input_ids'].shape[1] - option_length
+
+                    # Pass through the model
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+                    logits = outputs.logits
+
+                    # Get the logits for the option tokens
+                    logits_option = logits[:, start_position - 1:-1, :]
+                    log_probs = torch.nn.functional.log_softmax(logits_option, dim=-1)
+
+                    # Gather the log probabilities of the target tokens
+                    option_tokens_tensor = torch.tensor(option_tokens).unsqueeze(0).to(device)
+                    target_log_probs = log_probs.gather(2, option_tokens_tensor.unsqueeze(-1)).squeeze(-1)
+
+                    # Sum the log probabilities
+                    total_log_prob = target_log_probs.sum().item()
+
+                    option_scores.append(total_log_prob)
+
+                end_time = time.time()
+
+                # Record latency
+                inference_time = end_time - start_time
+                total_latency += inference_time
+                # Select the option with the highest score
+                predicted_index = int(np.argmax(option_scores))
+                predicted_answer_index = predicted_index
+
+                # Check if the prediction is correct
+                if predicted_answer_index == correct_answer_index:
+                    total_correct += 1
+                total_questions += 1
+                print(f"\nTotal questions: {total_questions}")
+                print(f"Total correct: {total_correct}")
+                print(f"Latency: {inference_time:.4f} seconds")
+                if total_questions % 100 == 0:
+                    print(f"Processed {total_questions} questions...")
+
+            except Exception as e:
+                print(f"An error occurred while processing example {idx + 1}: {e}")
+                continue
+
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    average_latency = total_latency / total_questions if total_questions > 0 else 0
+    print(f"\nTotal questions: {total_questions}")
+    print(f"Total correct: {total_correct}")
+    print(f"Accuracy: {accuracy * 100:.2f}%")
+    print(f"Average Inference Latency: {average_latency:.4f} seconds")
+
+    return accuracy
+
+
+def evaluate_arc_challenge(model, tokenizer, device, few_shot=False):
+    """
+    Evaluate the LLM on the ARC-Challenge dataset.
+
+    Args:
+        model: The LLM model.
+        tokenizer: Tokenizer corresponding to the LLM.
+        device: Device to perform evaluation on (CPU/GPU).
+        few_shot: Whether to perform few-shot evaluation.
+
+    Returns:
+        accuracy: The accuracy of the model on the ARC-Challenge dataset.
+    """
+    model.eval()
+    model.to(device)
+
+    # Load the ARC-Challenge dataset
+    dataset = load_dataset('ai2_arc', 'ARC-Challenge', cache_dir="ARC_Challenge_data")
+    test_dataset = dataset['test']
+
+    total_questions = 0
+    total_correct = 0
+    total_latency = 0
+
+    for idx, example in enumerate(test_dataset):
+        try:
+            question = example['question']
+            options = example['choices']['text']
+            correct_answer_label = example['answerKey']
+
+            # Map the correct answer label (e.g., 'A', 'B') to the index
+            label_to_index = {label: idx for idx, label in enumerate(example['choices']['label'])}
+            correct_answer_index = label_to_index[correct_answer_label]
+
+            # Construct a few-shot prompt if required
+            if few_shot:
+                few_shot_examples = random.sample(test_dataset, 5)
+                few_shot_prompt = ""
+                for few_shot_example in few_shot_examples:
+                    fs_question = few_shot_example['question']
+                    fs_options = few_shot_example['choices']['text']
+                    fs_correct_label = few_shot_example['answerKey']
+                    fs_correct_index = label_to_index[fs_correct_label]
+                    fs_correct_option = fs_options[fs_correct_index]
+                    fs_prompt = (
+                        f"Question: {fs_question}\n"
+                        + "".join([f"{label}. {opt}\n" for label, opt in zip(example['choices']['label'], fs_options)])
+                        + f"Answer: {fs_correct_option}\n\n"
+                    )
+                    few_shot_prompt += fs_prompt
+            else:
+                few_shot_prompt = ""
+
+            # Construct the test prompt
+            prompt = (
+                few_shot_prompt
+                + f"Question: {question}\n"
+                + "".join([f"{label}. {opt}\n" for label, opt in zip(example['choices']['label'], options)])
+                + "Answer:"
             )
 
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Tokenize and generate the model's response
+            start_time = time.time()
+            inputs = tokenizer(prompt, return_tensors='pt', truncation=True).to(device)
+            outputs = model.generate(
+                inputs['input_ids'],
+                max_length=512,
+                temperature=0.7,
+                num_return_sequences=1,
+                eos_token_id=tokenizer.eos_token_id
+            )
+            end_time = time.time()
 
-        # Extract the final answer from the generated text
-        # The final answer is usually after '####'
-        gen_answer_match = re.search(r'####\s*(.*)', generated_text)
-        if gen_answer_match:
-            gen_final_answer = gen_answer_match.group(1).strip()
-        else:
-            # As a fallback, try to find the last number in the generated text
-            gen_numbers = re.findall(r'\d+\.?\d*', generated_text)
-            gen_final_answer = gen_numbers[-1] if gen_numbers else None
+            # Decode the response and map it back to the option index
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            predicted_answer = response.split("Answer:")[-1].strip()
+            predicted_index = label_to_index.get(predicted_answer, -1)
 
-        # Extract the final answer from the reference answer
-        ref_answer_match = re.search(r'####\s*(.*)', answer)
-        if ref_answer_match:
-            ref_final_answer = ref_answer_match.group(1).strip()
-        else:
-            ref_numbers = re.findall(r'\d+\.?\d*', answer)
-            ref_final_answer = ref_numbers[-1] if ref_numbers else None
+            # Compare the predicted answer index with the correct answer index
+            if predicted_index == correct_answer_index:
+              total_correct += 1
+            total_questions += 1
 
-        if gen_final_answer and ref_final_answer:
-            # Compare the numerical answers
-            if gen_final_answer == ref_final_answer:
-                correct += 1
+            # Record latency
+            inference_time = end_time - start_time
+            total_latency += inference_time
 
-        total += 1
-        if total >= max_samples:
-            break
+            # Log details for this inference
+            current_accuracy = total_correct / total_questions if total_questions > 0 else 0
+            print(f"Question {idx + 1}:")
+            print(f"Predicted Answer: {predicted_answer}")
+            print(f"Correct Answer: {options[correct_answer_index]}")
+            print(f"Inference Time: {inference_time:.4f} seconds")
+            print(f"Total Questions: {total_questions}")
+            print(f"Total Correct: {total_correct}")
+            print(f"Current Accuracy: {current_accuracy * 100:.2f}%\n")
 
-    accuracy = correct / total if total > 0 else 0.0
+        except Exception as e:
+            print(f"An error occurred at question {idx + 1}: {e}")
+            continue
+
+    # Compute final metrics
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    average_latency = total_latency / total_questions if total_questions > 0 else 0
+    print(f"\nFinal Results:")
+    print(f"Total Questions: {total_questions}")
+    print(f"Total Correct: {total_correct}")
+    print(f"Final Accuracy: {accuracy * 100:.2f}%")
+    print(f"Average Inference Latency: {average_latency:.4f} seconds")
+
     return accuracy
 
-def evaluate_math(model, tokenizer):
-    import torch
-    import json
-    import os
-    import re
 
-    # Path to the MATH dataset directory (adjust accordingly)
-    dataset_dir = 'path_to_math_dataset/test'  # Update with your dataset path
+def evaluate_arc_easy(model, tokenizer, device, few_shot=False):
+    """
+    Evaluate the LLM on the ARC-Challenge dataset.
 
-    total = 0
-    correct = 0
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
+    Args:
+        model: The LLM model.
+        tokenizer: Tokenizer corresponding to the LLM.
+        device: Device to perform evaluation on (CPU/GPU).
+        few_shot: Whether to perform few-shot evaluation.
+
+    Returns:
+        accuracy: The accuracy of the model on the ARC-Challenge dataset.
+    """
     model.eval()
+    model.to(device)
 
-    # Limit to first 100 samples for testing; adjust as needed
-    max_samples = 100
+    # Load the ARC-Challenge dataset
+    dataset = load_dataset('ai2_arc', 'ARC-Easy', cache_dir="ARC_Easy_data")
+    test_dataset = dataset['test']
 
-    # Collect all problem file paths
-    problem_files = []
-    for root, dirs, files in os.walk(dataset_dir):
-        for file in files:
-            if file.endswith('.json'):
-                problem_files.append(os.path.join(root, file))
+    total_questions = 0
+    total_correct = 0
+    total_latency = 0
 
-    for problem_file in problem_files[:max_samples]:
-        with open(problem_file, 'r') as f:
-            problem = json.load(f)
+    for idx, example in enumerate(test_dataset):
+        try:
+            question = example['question']
+            options = example['choices']['text']
+            correct_answer_label = example['answerKey']
 
-        question = problem['problem']
-        solution = problem['solution']
+            # Map the correct answer label (e.g., 'A', 'B') to the index
+            label_to_index = {label: idx for idx, label in enumerate(example['choices']['label'])}
+            correct_answer_index = label_to_index[correct_answer_label]
 
-        # Prepare the prompt
-        prompt = question + "\nAnswer:"
+            # Construct a few-shot prompt if required
+            if few_shot:
+                few_shot_examples = random.sample(test_dataset, 5)
+                few_shot_prompt = ""
+                for few_shot_example in few_shot_examples:
+                    fs_question = few_shot_example['question']
+                    fs_options = few_shot_example['choices']['text']
+                    fs_correct_label = few_shot_example['answerKey']
+                    fs_correct_index = label_to_index[fs_correct_label]
+                    fs_correct_option = fs_options[fs_correct_index]
+                    fs_prompt = (
+                        f"Question: {fs_question}\n"
+                        + "".join([f"{label}. {opt}\n" for label, opt in zip(example['choices']['label'], fs_options)])
+                        + f"Answer: {fs_correct_option}\n\n"
+                    )
+                    few_shot_prompt += fs_prompt
+            else:
+                few_shot_prompt = ""
 
-        inputs = tokenizer(prompt, return_tensors='pt').to(device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=512,
-                temperature=0.0,
-                eos_token_id=tokenizer.eos_token_id,
+            # Construct the test prompt
+            prompt = (
+                few_shot_prompt
+                + f"Question: {question}\n"
+                + "".join([f"{label}. {opt}\n" for label, opt in zip(example['choices']['label'], options)])
+                + "Answer:"
             )
 
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        # Extract the final answer from the generated text
-        # Assuming the answer is between '\boxed{}' in LaTeX
-        gen_answer_match = re.search(r'\\boxed\{([^}]*)\}', generated_text)
-        if gen_answer_match:
-            gen_final_answer = gen_answer_match.group(1).strip()
-        else:
-            # Fallback: extract the last numerical expression
-            gen_numbers = re.findall(r'\d+\.?\d*', generated_text)
-            gen_final_answer = gen_numbers[-1] if gen_numbers else None
-
-        # Extract the final answer from the reference solution
-        ref_answer_match = re.search(r'\\boxed\{([^}]*)\}', solution)
-        if ref_answer_match:
-            ref_final_answer = ref_answer_match.group(1).strip()
-        else:
-            ref_numbers = re.findall(r'\d+\.?\d*', solution)
-            ref_final_answer = ref_numbers[-1] if ref_numbers else None
-
-        if gen_final_answer and ref_final_answer:
-            # Compare the numerical answers
-            if gen_final_answer == ref_final_answer:
-                correct += 1
-
-        total += 1
-
-    accuracy = correct / total if total > 0 else 0.0
-    return accuracy
-
-def evaluate_arc_challenge(model, tokenizer):
-    import torch
-    from datasets import load_dataset
-    import re
-
-    # Load the ARC Challenge dataset
-    dataset = load_dataset('ai2_arc', 'ARC-Challenge')
-
-    total = 0
-    correct = 0
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
-
-    # Limit to first 100 samples for testing; adjust as needed
-    max_samples = 100
-
-    for sample in dataset['test']:
-        question = sample['question'].strip()
-        choices = sample['choices']['text']
-        labels = sample['choices']['label']
-        correct_answer = sample['answerKey'].strip()
-
-        # Prepare the prompt
-        prompt = f"Question: {question}\nChoices:\n"
-        for label, choice in zip(labels, choices):
-            prompt += f"{label}: {choice}\n"
-        prompt += "Answer:"
-
-        inputs = tokenizer(prompt, return_tensors='pt').to(device)
-
-        with torch.no_grad():
+            # Tokenize and generate the model's response
+            start_time = time.time()
+            inputs = tokenizer(prompt, return_tensors='pt', truncation=True).to(device)
             outputs = model.generate(
-                **inputs,
-                max_new_tokens=10,
-                temperature=0.0,
-                eos_token_id=tokenizer.eos_token_id,
+                inputs['input_ids'],
+                max_length=512,
+                temperature=0.7,
+                num_return_sequences=1,
+                eos_token_id=tokenizer.eos_token_id
             )
+            end_time = time.time()
 
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # Extract the first character after 'Answer:' as the predicted label
-        gen_answer_match = re.search(r'Answer:\s*([A-Za-z])', generated_text)
-        if gen_answer_match:
-            predicted_answer = gen_answer_match.group(1).strip().upper()
-        else:
-            predicted_answer = None
+            # Decode the response and map it back to the option index
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            predicted_answer = response.split("Answer:")[-1].strip()
+            predicted_index = label_to_index.get(predicted_answer, -1)
 
-        if predicted_answer == correct_answer:
-            correct += 1
+            # Compare the predicted answer index with the correct answer index
+            if predicted_index == correct_answer_index:
+              total_correct += 1
+            total_questions += 1
 
-        total += 1
-        if total >= max_samples:
-            break
+            # Record latency
+            inference_time = end_time - start_time
+            total_latency += inference_time
 
-    accuracy = correct / total if total > 0 else 0.0
+            # Log details for this inference
+            current_accuracy = total_correct / total_questions if total_questions > 0 else 0
+            print(f"Question {idx + 1}:")
+            print(f"Predicted Answer: {predicted_answer}")
+            print(f"Correct Answer: {options[correct_answer_index]}")
+            print(f"Inference Time: {inference_time:.4f} seconds")
+            print(f"Total Questions: {total_questions}")
+            print(f"Total Correct: {total_correct}")
+            print(f"Current Accuracy: {current_accuracy * 100:.2f}%\n")
+
+        except Exception as e:
+            print(f"An error occurred at question {idx + 1}: {e}")
+            continue
+
+    # Compute final metrics
+    accuracy = total_correct / total_questions if total_questions > 0 else 0
+    average_latency = total_latency / total_questions if total_questions > 0 else 0
+    print(f"\nFinal Results:")
+    print(f"Total Questions: {total_questions}")
+    print(f"Total Correct: {total_correct}")
+    print(f"Final Accuracy: {accuracy * 100:.2f}%")
+    print(f"Average Inference Latency: {average_latency:.4f} seconds")
+
     return accuracy
 
-def evaluate_gpqa(model, tokenizer):
-    import torch
-    from datasets import load_dataset
-    import re
 
-    # Load a general QA dataset; using 'nq_open' as an example
-    dataset = load_dataset('nq_open')
 
-    total = 0
-    correct = 0
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
 
-    # Limit to first 100 samples for testing; adjust as needed
-    max_samples = 100
-
-    for sample in dataset['test']:
-        question = sample['question'].strip()
-        answers = sample['answers']
-
-        # Prepare the prompt
-        prompt = f"Question: {question}\nAnswer:"
-
-        inputs = tokenizer(prompt, return_tensors='pt').to(device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=50,
-                temperature=0.0,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # Extract the generated answer
-        generated_answer = generated_text.split('Answer:')[-1].strip()
-
-        # Check if the generated answer matches any of the reference answers
-        if any(generated_answer.lower() == ans.lower() for ans in answers):
-            correct += 1
-
-        total += 1
-        if total >= max_samples:
-            break
-
-    accuracy = correct / total if total > 0 else 0.0
-    return accuracy
-
-def evaluate_hellaswag(model, tokenizer):
-    import torch
-    from datasets import load_dataset
-    import re
-
-    # Load the HellaSwag dataset
-    dataset = load_dataset('hellaswag')
-
-    total = 0
-    correct = 0
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
-
-    # Limit to first 100 samples for testing; adjust as needed
-    max_samples = 100
-
-    for sample in dataset['validation']:
-        context = sample['ctx_a'].strip()
-        endings = [sample[f'ending_{i}'].strip() for i in range(4)]
-        correct_label = sample['label']
-
-        # Prepare the prompt
-        prompt = f"{context}"
-
-        inputs = tokenizer(prompt, return_tensors='pt').to(device)
-
-        with torch.no_grad():
-            logits = []
-            for ending in endings:
-                input_ids_option = tokenizer.encode(ending, return_tensors='pt').to(device)
-                total_input = torch.cat([inputs['input_ids'], input_ids_option], dim=-1)
-                attention_mask = torch.ones_like(total_input).to(device)
-                output = model(input_ids=total_input, attention_mask=attention_mask)
-                # Get the log probability of the continuation
-                logit = output.logits[:, -input_ids_option.size(-1):, :]
-                log_probs = torch.nn.functional.log_softmax(logit, dim=-1)
-                selected_log_probs = log_probs.gather(2, input_ids_option.unsqueeze(-1)).squeeze(-1)
-                total_log_prob = selected_log_probs.sum().item()
-                logits.append(total_log_prob)
-
-            predicted_label = logits.index(max(logits))
-
-            if predicted_label == correct_label:
-                correct += 1
-
-        total += 1
-        if total >= max_samples:
-            break
-
-    accuracy = correct / total if total > 0 else 0.0
-    return accuracy
-
-def evaluate_infinitebench_mc(model, tokenizer):
-    import torch
-    import os
-    import json
-
-    # Path to InfiniteBench En.MC dataset
-    dataset_path = 'path_to_infinitebench/En.MC'  # Update accordingly
-
-    total = 0
-    correct = 0
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
-
-    # Limit to a few samples for testing due to resource constraints
-    max_samples = 10
-
-    # Load the dataset
-    with open(os.path.join(dataset_path, 'test.json'), 'r') as f:
-        data = json.load(f)
-
-    for sample in data['data'][:max_samples]:
-        context = sample['context']
-        question = sample['question']
-        choices = sample['choices']
-        correct_answer = sample['answer']
-
-        # Prepare the prompt
-        prompt = f"{context}\n\nQuestion: {question}\nChoices:\n"
-        for idx, choice in enumerate(choices):
-            prompt += f"{idx}: {choice}\n"
-        prompt += "Answer:"
-
-        inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=128000).to(device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=10,
-                temperature=0.0,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # Extract the predicted choice index
-        predicted_answer = int(generated_text.strip().split('Answer:')[-1].strip())
-
-        if predicted_answer == correct_answer:
-            correct += 1
-
-        total += 1
-
-    accuracy = correct / total if total > 0 else 0.0
-    return accuracy
-
-def evaluate_mgsm(model, tokenizer):
-    import torch
-    from datasets import load_dataset
-    import re
-
-    # Load the MGSM dataset; assuming it's available via Hugging Face Datasets
-    dataset = load_dataset('mgsm')
-
-    total = 0
-    correct = 0
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
-
-    # Limit to first 100 samples for testing; adjust as needed
-    max_samples = 100
-
-    for sample in dataset['test']:
-        question = sample['question'].strip()
-        answer = sample['answer'].strip()
-
-        # Prepare the prompt with zero-shot CoT
-        prompt = question + "\nAnswer: Let's think step by step."
-
-        inputs = tokenizer(prompt, return_tensors='pt').to(device)
-
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=256,
-                temperature=0.0,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-
-        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-        # Extract the final answer from the generated text
-        # The final answer is usually after '####' or the last number
-        gen_answer_match = re.search(r'####\s*(.*)', generated_text)
-        if gen_answer_match:
-            gen_final_answer = gen_answer_match.group(1).strip()
-        else:
-            # Fallback: extract the last number in the generated text
-            gen_numbers = re.findall(r'\d+\.?\d*', generated_text)
-            gen_final_answer = gen_numbers[-1] if gen_numbers else None
-
-        # Extract the final answer from the reference answer
-        ref_answer_match = re.search(r'####\s*(.*)', answer)
-        if ref_answer_match:
-            ref_final_answer = ref_answer_match.group(1).strip()
-        else:
-            ref_numbers = re.findall(r'\d+\.?\d*', answer)
-            ref_final_answer = ref_numbers[-1] if ref_numbers else None
-
-        if gen_final_answer and ref_final_answer:
-            # Compare the numerical answers
-            if gen_final_answer == ref_final_answer:
-                correct += 1
-
-        total += 1
-        if total >= max_samples:
-            break
-
-    accuracy = correct / total if total > 0 else 0.0
-    return accuracy
 
 def main():
-    import argparse
-    import sys
-
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description='Benchmark different versions of Llama-3.2-1B.')
-    parser.add_argument('--model_type', type=str, required=True,
-                        choices=['original', 'quantized', 'compressed'],
-                        help='Type of model to benchmark.')
-    parser.add_argument('--model_path', type=str, required=True,
-                        help='Path to the model directory.')
-    parser.add_argument('--benchmark', type=str, required=True,
-                        choices=['mmlu', 'open_rewrite', 'tldr9', 'ifeval', 'gsm8k', 'math',
-                                 'arc_challenge', 'gpqa', 'hellaswag', 'infinitebench_mc', 'mgsm'],
-                        help='Name of the benchmark to run.')
+    parser = argparse.ArgumentParser(description='Evaluate quantized and compressed models on benchmarks.')
+    parser.add_argument('--model_name', type=str, default='llama3.2-1B-quantized', help='Model name or path')
+    parser.add_argument('--compressed_model', action='store_true', help='Use compressed model')
+    parser.add_argument('--compressed_weights', type=str, default='llama3.2-1B_Compressed', help='Directory containing compressed weights')
+    parser.add_argument('--compression_tables', type=str, default='llama3.2-1B_Compressed', help='Directory containing compression tables')
+    parser.add_argument('--sequence_length', type=int, default=4, help='Sequence length for compression')
+    parser.add_argument('--benchmark', type=str, choices=['MMLU', 'ARC_Challenge','ARC_Easy'], default='MMLU', help='Benchmark to evaluate the model')
+    parser.add_argument('--few_shot', action='store_true', help='Use few-shot evaluation')
     args = parser.parse_args()
 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     # Load the tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-
-    # Load the model based on the type
-    if args.model_type == 'original':
-        model = run_original_model(args.model_path)
-    elif args.model_type == 'quantized':
-        model = run_quantized_model(args.model_path)
-    elif args.model_type == 'compressed':
-        model = run_compressed_model(args.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, cache_dir="./")
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+    # Load the model
+    if args.compressed_model:
+        model = AutoModelForCausalLM.from_pretrained(args.model_name)
+        replace_linear_layers(model, args.compressed_weights, args.compression_tables, sequence_length=args.sequence_length)
     else:
-        print("Invalid model type selected.")
-        sys.exit(1)
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, device_map="auto", cache_dir="./")
 
-    # Run the selected benchmark
-    if args.benchmark == 'mmlu':
-        accuracy = evaluate_mmlu(model, tokenizer)
-        print(f"MMLU Accuracy: {accuracy:.2%}")
-    elif args.benchmark == 'open_rewrite':
-        average_rougeL = evaluate_open_rewrite(model, tokenizer)
-        print(f"Open-Rewrite Average Rouge-L Score: {average_rougeL:.4f}")
-    elif args.benchmark == 'tldr9':
-        average_rougeL = evaluate_tldr9(model, tokenizer)
-        print(f"TLDR9+ Average Rouge-L Score: {average_rougeL:.4f}")
-    elif args.benchmark == 'ifeval':
-        average_rougeL = evaluate_ifeval(model, tokenizer)
-        print(f"IFEval Average Rouge-L Score: {average_rougeL:.4f}")
-    elif args.benchmark == 'gsm8k':
-        accuracy = evaluate_gsm8k(model, tokenizer)
-        print(f"GSM8K Accuracy: {accuracy:.2%}")
-    elif args.benchmark == 'math':
-        accuracy = evaluate_math(model, tokenizer)
-        print(f"MATH Accuracy: {accuracy:.2%}")
-    elif args.benchmark == 'arc_challenge':
-        accuracy = evaluate_arc_challenge(model, tokenizer)
-        print(f"ARC Challenge Accuracy: {accuracy:.2%}")
-    elif args.benchmark == 'gpqa':
-        accuracy = evaluate_gpqa(model, tokenizer)
-        print(f"GPQA Accuracy: {accuracy:.2%}")
-    elif args.benchmark == 'hellaswag':
-        accuracy = evaluate_hellaswag(model, tokenizer)
-        print(f"HellaSwag Accuracy: {accuracy:.2%}")
-    elif args.benchmark == 'infinitebench_mc':
-        accuracy = evaluate_infinitebench_mc(model, tokenizer)
-        print(f"InfiniteBench En.MC Accuracy: {accuracy:.2%}")
-    elif args.benchmark == 'mgsm':
-        accuracy = evaluate_mgsm(model, tokenizer)
-        print(f"MGSM Accuracy: {accuracy:.2%}")
-    else:
-        print(f"Benchmark {args.benchmark} not recognized.")
-        sys.exit(1)
+    # Evaluate the model on the chosen benchmark
+    if args.benchmark == 'MMLU':
+      accuracy = evaluate_mmlu(model, tokenizer, device=device, few_shot=args.few_shot)
+      print(f"MMLU Accuracy: {accuracy * 100:.2f}%")
+    elif args.benchmark == 'ARC_Challenge':
+      accuracy = evaluate_arc_challenge(model, tokenizer, device=device, few_shot=args.few_shot)
+      print(f"ARC Challenge Accuracy: {accuracy * 100:.2f}%")
+    elif args.benchmark == 'ARC_Easy':
+      accuracy = evaluate_arc_easy(model, tokenizer, device=device, few_shot=args.few_shot)
+      print(f"ARC Easy Accuracy: {accuracy * 100:.2f}%")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-    # python benchmark.py --model_type original --model_path path_to_model --benchmark gsm8k
